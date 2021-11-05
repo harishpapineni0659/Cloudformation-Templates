@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: github-codepipeline
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  GitHubOAuthToken:
+    Type: String
+    NoEcho: true
+    MinLength: 40
+    MaxLength: 40
+    Default: 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
+
+  GitHubOwner:
+    Type: String
+    Default: harishpapineni0659
+    AllowedPattern: "[A-Za-z0-9-]+"
+
+  GitHubRepo:
+    Type: String
+    Default: da-bh-vlm-splitter
+    AllowedPattern: "[A-Za-z0-9-]+"
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    AllowedPattern: "[A-Za-z0-9-]+"
+
+  ApplicationStackName:
+    Type: String
+    Default: github-codepipeline-app
+    AllowedPattern: "[A-Za-z0-9-]+"
+
+  PipelineBucket:
+    Type: String
+
+  BucketSourceLambdaTemplate:
+    Type: String
+    Default: template-lambda-caor
+
+  LambdaFunctionName:
+    Type: String
+    Default: Lambda-function-name
+
+  lambdaStackName:
+    Type: String
+    Default: Stack-name-lambda
+
+#****************************
+#SOURCE BLOCK
+#****************************
+Resources:
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PipelineBucket
+      VersioningConfiguration:
+        Status: Enabled
+
+  GithubWebhook:
+    Type: 'AWS::CodePipeline::Webhook'
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubOAuthToken
+      RegisterWithThirdParty: 'true'
+      Filters:
+      - JsonPath: "$.ref"
+        MatchEquals: refs/heads/{Branch}
+      TargetPipeline: !Ref CodePipeline
+      TargetAction: Source
+      TargetPipelineVersion: !GetAtt CodePipeline.Version
+  
+
+  #****************************
+  #PIPELINE BLOCK
+  #****************************
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactsBucket
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+      - Name: Source
+        Actions:
+        - Name: Source
+          InputArtifacts: []
+          ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Version: 1
+            Provider: GitHub
+          OutputArtifacts:
+            - Name: SourceCode
+          Configuration:
+            Owner: !Ref GitHubOwner
+            Repo: !Ref GitHubRepo
+            Branch: !Ref GitHubBranch
+            PollForSourceChanges: false
+            OAuthToken: !Ref GitHubOAuthToken
+          RunOrder: 1
+
+        - Name: SourceCFLambda
+          InputArtifacts: []
+          ActionTypeId:
+            Category: Source
+            Owner: AWS
+            Version: 1
+            Provider: S3
+          Configuration:
+            S3Bucket: !Sub '${BucketSourceLambdaTemplate}'
+            S3ObjectKey: lambdaTemplate.zip
+          OutputArtifacts:
+            - Name: SourceCFLambda
+          RunOrder: 2
+
+      - Name: Deploy
+        Actions:
+          - Name: CreateSourceCodeZip
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: S3
+              Version: '1'
+            InputArtifacts:
+              - Name: SourceCode
+            Configuration:
+              BucketName: !Ref PipelineBucket
+              Extract: false
+              ObjectKey: code.zip
+            RunOrder: 1
+          - Name: CreateSourceLambdaCodeYML
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: S3
+              Version: '1'
+            InputArtifacts:
+              - Name: SourceCFLambda
+            Configuration:
+              BucketName: !Ref PipelineBucket
+              Extract: false
+              ObjectKey: lambdaTemplate.zip
+            RunOrder: 2
+          - Name: CreateLambdaCFDelete
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: DELETE_ONLY
+              Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              TemplatePath: SourceCFLambda::lambdaTemplate.yml
+              ChangeSetName: !Ref lambdaStackName
+              StackName: !Ref lambdaStackName
+              RoleArn: !GetAtt CloudformationRole.Arn
+            InputArtifacts: []
+            RunOrder: 3
+          - Name: CreateLambdaCFPrepare
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: CHANGE_SET_REPLACE
+              Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              TemplatePath: SourceCFLambda::lambdaTemplate.yml
+              ParameterOverrides:
+                  Fn::Sub: '{ "LambdaFunctionName": "${LambdaFunctionName}", "PipelineBucket": "${PipelineBucket}" }'
+              ChangeSetName: !Ref lambdaStackName
+              StackName: !Ref lambdaStackName
+              RoleArn: !GetAtt CloudformationRole.Arn
+            InputArtifacts: 
+              - Name: SourceCFLambda
+            RunOrder: 4
+          - Name: CreateLambdaCFExecute
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: CHANGE_SET_EXECUTE
+              Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+              TemplatePath: SourceCFLambda::lambdaTemplate.yml
+              ParameterOverrides:
+                  Fn::Sub: '{ "LambdaFunctionName": "${LambdaFunctionName}", "PipelineBucket": "${PipelineBucket}" }'
+              ChangeSetName: !Ref lambdaStackName
+              StackName: !Ref lambdaStackName
+              RoleArn: !GetAtt CloudformationRole.Arn
+            InputArtifacts: 
+              - Name: SourceCFLambda
+            RunOrder: 5
+          - Name: InvokeLambda
+            ActionTypeId:
+              Category: Invoke
+              Owner: AWS
+              Provider: Lambda
+              Version: 1
+            InputArtifacts:
+              - Name: SourceCode
+            Configuration:
+              FunctionName: !Ref LambdaFunctionName
+            RunOrder: 6
+
+  #****************************
+  #IAM BLOCK
+  #****************************
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codepipeline.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess #TODO: Reduce permissions
+
+  CloudformationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess #TODO: Reduce permissions
